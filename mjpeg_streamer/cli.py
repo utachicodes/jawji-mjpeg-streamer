@@ -107,6 +107,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="List available audio input devices and exit",
     )
+    parser.add_argument(
+        "--auth-token",
+        type=str,
+        default=None,
+        help="Authentication token for streams (optional). If set, clients must provide this token via Authorization header or ?token= query parameter.",
+    )
+    parser.add_argument(
+        "--auth-header",
+        type=str,
+        default="Authorization",
+        help="HTTP header name for authentication token (default: Authorization)",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=int,
+        default=0,
+        help="Enable rate limiting: max requests per window (0 to disable, default: 0)",
+    )
+    parser.add_argument(
+        "--rate-limit-window",
+        type=int,
+        default=60,
+        help="Rate limit window in seconds (default: 60)",
+    )
     args: argparse.Namespace = parser.parse_args()
     
     # Validate and sanitize inputs
@@ -121,6 +145,18 @@ def parse_args() -> argparse.Namespace:
     args.fps = _validate_bounds(args.fps, 1, 120, "fps")
     args.audio_rate = _validate_bounds(args.audio_rate, 8000, 192000, "audio-rate")
     args.audio_channels = _validate_bounds(args.audio_channels, 1, 8, "audio-channels")
+    args.rate_limit = _validate_bounds(args.rate_limit, 0, 10000, "rate-limit")
+    args.rate_limit_window = _validate_bounds(args.rate_limit_window, 1, 3600, "rate-limit-window")
+    
+    # Validate auth token if provided
+    if args.auth_token:
+        if len(args.auth_token) < 8:
+            raise ValueError("Auth token must be at least 8 characters long")
+        if len(args.auth_token) > 256:
+            raise ValueError("Auth token must be at most 256 characters long")
+        # Only allow alphanumeric and common safe characters
+        if not re.match(r"^[a-zA-Z0-9._-]+$", args.auth_token):
+            raise ValueError("Auth token can only contain alphanumeric characters, dots, underscores, and hyphens")
     
     args.source = [[0]] if args.source is None else args.source
     args.source = [item for sublist in args.source for item in sublist]
@@ -178,7 +214,15 @@ def main() -> None:
     size: Tuple[int, int] = (args.width, args.height)
     streams: List[ManagedStream] = []
     audio_streams: List[AudioStream] = []
-    server = Server(args.host, args.port)
+    server = Server(
+        args.host,
+        args.port,
+        auth_token=args.auth_token,
+        auth_header=args.auth_header,
+        enable_rate_limiting=args.rate_limit > 0,
+        rate_limit_max=args.rate_limit,
+        rate_limit_window=args.rate_limit_window,
+    )
 
     if args.show_bandwidth:
         bandwidth: Dict[str, int] = {}

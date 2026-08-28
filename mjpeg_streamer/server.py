@@ -82,6 +82,36 @@ def _rate_limit_middleware(app: web.Application, handler):
     return middleware_handler
 
 
+def _auth_middleware(app: web.Application, handler):
+    async def middleware_handler(request: web.Request) -> web.Response:
+        if hasattr(app, "_server_instance"):
+            server = app._server_instance
+            if server._auth_token:
+                # Skip auth for root and player page
+                if request.path in ("/", "/player"):
+                    return await handler(request)
+                
+                auth_header = request.headers.get(server._auth_header, "")
+                # Support Bearer token format
+                if auth_header.startswith("Bearer "):
+                    token = auth_header[7:]
+                else:
+                    token = auth_header
+                
+                # Also check query parameter for convenience (e.g., for <img> tags)
+                if not token:
+                    token = request.query.get("token", "")
+                
+                if token != server._auth_token:
+                    return web.Response(
+                        status=401,
+                        text="Unauthorized: Invalid or missing token",
+                        headers={"WWW-Authenticate": f'Bearer realm="mjpeg-streamer"'}
+                    )
+        return await handler(request)
+    return middleware_handler
+
+
 class _StreamHandler:
     def __init__(self, stream: StreamBase, server: "Server") -> None:
         self._stream = stream
@@ -204,6 +234,8 @@ class Server:
         enable_rate_limiting: bool = False,
         rate_limit_max: int = 100,
         rate_limit_window: int = 60,
+        auth_token: Optional[str] = None,
+        auth_header: str = "Authorization",
     ) -> None:
         if isinstance(host, str):
             self._host: List[str,] = [
@@ -225,6 +257,8 @@ class Server:
         self._rate_limiter: Optional[RateLimiter] = (
             RateLimiter(rate_limit_max, rate_limit_window) if enable_rate_limiting else None
         )
+        self._auth_token = auth_token
+        self._auth_header = auth_header
         self._app: web.Application = web.Application()
         self._app_is_running: bool = False
         self._cap_routes: List[str,] = []
@@ -272,6 +306,8 @@ class Server:
         self._app.middlewares.append(_security_headers_middleware)
         if self._enable_rate_limiting:
             self._app.middlewares.append(_rate_limit_middleware)
+        if self._auth_token:
+            self._app.middlewares.append(_auth_middleware)
         self._app._server_instance = self
         self._app.router.add_route("GET", "/", self.__root_handler)
         if self._audio_routes:
