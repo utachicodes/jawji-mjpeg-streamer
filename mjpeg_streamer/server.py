@@ -16,7 +16,7 @@ from .stream import AudioStream, StreamBase
 
 
 class RateLimiter:
-    """Simple token bucket rate limiter per IP."""
+    """Simple token bucket rate limiter per IP (in-memory)."""
     
     def __init__(self, max_requests: int = 100, window_seconds: int = 60) -> None:
         self.max_requests = max_requests
@@ -44,6 +44,68 @@ class RateLimiter:
             if now - req_time < self.window_seconds
         ]
         return max(0, self.max_requests - len(recent))
+
+
+class RedisRateLimiter:
+    """Redis-backed rate limiter for distributed deployments (Upstash compatible)."""
+    
+    def __init__(self, max_requests: int = 100, window_seconds: int = 60, redis_url: Optional[str] = None) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._redis_url = redis_url
+        self._redis = None
+        self._local_fallback = RateLimiter(max_requests, window_seconds)
+        self._use_redis = False
+    
+    async def _ensure_redis(self) -> None:
+        if self._redis is None and self._redis_url:
+            try:
+                import redis.asyncio as redis
+                self._redis = redis.from_url(self._redis_url, decode_responses=True)
+                await self._redis.ping()
+                self._use_redis = True
+            except Exception:
+                # Fall back to local rate limiter
+                self._use_redis = False
+                self._redis = None
+    
+    async def is_allowed(self, client_ip: str) -> bool:
+        await self._ensure_redis()
+        if self._use_redis and self._redis:
+            try:
+                key = f"ratelimit:{client_ip}"
+                pipe = self._redis.pipeline()
+                now = time.time()
+                window_start = now - self.window_seconds
+                
+                # Remove old entries
+                pipe.zremrangebyscore(key, 0, window_start)
+                # Count current requests
+                pipe.zcard(key)
+                # Add current request
+                pipe.zadd(key, {f"{now}:{id(client_ip)}": now})
+                # Set expiry
+                pipe.expire(key, self.window_seconds + 1)
+                results = await pipe.execute()
+                
+                current_count = results[1]
+                if current_count >= self.max_requests:
+                    return False
+                return True
+            except Exception:
+                # Fall back to local
+                return await self._local_fallback.is_allowed(client_ip)
+        return await self._local_fallback.is_allowed(client_ip)
+    
+    def get_remaining(self, client_ip: str) -> int:
+        # For Redis, we'd need async, so just use local for remaining
+        return self._local_fallback.get_remaining(client_ip)
+    
+    async def close(self) -> None:
+        if self._redis:
+            await self._redis.close()
+            self._redis = None
+            self._use_redis = False
 
 
 def _security_headers_middleware(app: web.Application, handler):
@@ -242,6 +304,7 @@ class Server:
         enable_rate_limiting: bool = False,
         rate_limit_max: int = 100,
         rate_limit_window: int = 60,
+        rate_limit_redis_url: Optional[str] = None,
         auth_token: Optional[str] = None,
         auth_header: str = "Authorization",
         ssl_certfile: Optional[str] = None,
@@ -267,9 +330,14 @@ class Server:
         self._enable_rate_limiting = enable_rate_limiting
         self._rate_limit_max = rate_limit_max
         self._rate_limit_window = rate_limit_window
-        self._rate_limiter: Optional[RateLimiter] = (
-            RateLimiter(rate_limit_max, rate_limit_window) if enable_rate_limiting else None
-        )
+        self._rate_limit_redis_url = rate_limit_redis_url
+        if enable_rate_limiting:
+            if rate_limit_redis_url:
+                self._rate_limiter: Optional[RateLimiter] = RedisRateLimiter(rate_limit_max, rate_limit_window, rate_limit_redis_url)
+            else:
+                self._rate_limiter = RateLimiter(rate_limit_max, rate_limit_window)
+        else:
+            self._rate_limiter = None
         self._auth_token = auth_token
         self._auth_header = auth_header
         self._ssl_certfile = ssl_certfile
@@ -385,6 +453,14 @@ class Server:
         if self.is_running():
             self._app_is_running = False
             print("\nStopping...\n")
+            # Close Redis connection if using Redis rate limiter
+            if self._rate_limiter and hasattr(self._rate_limiter, 'close'):
+                import asyncio
+                try:
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(self._rate_limiter.close())
+                except Exception:
+                    pass
             GracefulExit()
             print("\nServer stopped\n")
         else:

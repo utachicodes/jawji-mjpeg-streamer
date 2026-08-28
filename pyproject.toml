@@ -66,6 +66,9 @@ dependencies = [
 audio = [
   "pyaudio",
 ]
+redis = [
+  "redis>=5.0",
+]
 [project.urls]
 Homepage = "https://github.com/egeakman/mjpeg-streamer"
 Issues = "https://github.com/egeakman/mjpeg-streamer/issues"

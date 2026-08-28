@@ -180,6 +180,12 @@ def parse_args() -> argparse.Namespace:
         help="Rate limit window in seconds (default: 60)",
     )
     parser.add_argument(
+        "--rate-limit-redis-url",
+        type=str,
+        default=None,
+        help="Redis URL for distributed rate limiting (e.g., rediss://user:pass@host:port). Requires redis-py. Falls back to in-memory if unavailable.",
+    )
+    parser.add_argument(
         "--ssl-certfile",
         type=str,
         default=None,
@@ -314,6 +320,7 @@ def main() -> None:
         enable_rate_limiting=args.rate_limit > 0,
         rate_limit_max=args.rate_limit,
         rate_limit_window=args.rate_limit_window,
+        rate_limit_redis_url=args.rate_limit_redis_url,
         ssl_certfile=args.ssl_certfile,
         ssl_keyfile=args.ssl_keyfile,
         ssl_password=args.ssl_password,
