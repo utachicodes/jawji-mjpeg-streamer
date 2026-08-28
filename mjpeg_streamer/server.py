@@ -1,5 +1,7 @@
 import asyncio
 import threading
+import time
+from collections import defaultdict
 from typing import List, Optional, Union
 
 import aiohttp
@@ -8,6 +10,37 @@ from aiohttp.web_runner import GracefulExit
 from multidict import MultiDict
 
 from .stream import AudioStream, StreamBase
+
+
+class RateLimiter:
+    """Simple token bucket rate limiter per IP."""
+    
+    def __init__(self, max_requests: int = 100, window_seconds: int = 60) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._requests: defaultdict[str, List[float]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+    
+    async def is_allowed(self, client_ip: str) -> bool:
+        async with self._lock:
+            now = time.time()
+            # Clean old requests
+            self._requests[client_ip] = [
+                req_time for req_time in self._requests[client_ip]
+                if now - req_time < self.window_seconds
+            ]
+            if len(self._requests[client_ip]) >= self.max_requests:
+                return False
+            self._requests[client_ip].append(now)
+            return True
+    
+    def get_remaining(self, client_ip: str) -> int:
+        now = time.time()
+        recent = [
+            req_time for req_time in self._requests[client_ip]
+            if now - req_time < self.window_seconds
+        ]
+        return max(0, self.max_requests - len(recent))
 
 
 def _security_headers_middleware(app: web.Application, handler):
@@ -23,6 +56,29 @@ def _security_headers_middleware(app: web.Application, handler):
             if request.url.scheme == "https":
                 response.headers["Strict-Transport-Security"] = f"max-age={server._hsts_max_age}; includeSubDomains"
         return response
+    return middleware_handler
+
+
+def _rate_limit_middleware(app: web.Application, handler):
+    async def middleware_handler(request: web.Request) -> web.Response:
+        if hasattr(app, "_server_instance") and app._server_instance._rate_limiter:
+            server = app._server_instance
+            client_ip = request.remote or "unknown"
+            if not await server._rate_limiter.is_allowed(client_ip):
+                return web.Response(
+                    status=429,
+                    text="Rate limit exceeded",
+                    headers={
+                        "Retry-After": str(server._rate_limit_window),
+                        "X-RateLimit-Limit": str(server._rate_limit_max),
+                        "X-RateLimit-Remaining": "0",
+                    }
+                )
+            response = await handler(request)
+            response.headers["X-RateLimit-Limit"] = str(server._rate_limit_max)
+            response.headers["X-RateLimit-Remaining"] = str(server._rate_limiter.get_remaining(client_ip))
+            return response
+        return await handler(request)
     return middleware_handler
 
 
@@ -145,6 +201,9 @@ class Server:
         enable_security_headers: bool = True,
         hsts_max_age: int = 31536000,
         csp_policy: Optional[str] = None,
+        enable_rate_limiting: bool = False,
+        rate_limit_max: int = 100,
+        rate_limit_window: int = 60,
     ) -> None:
         if isinstance(host, str):
             self._host: List[str,] = [
@@ -160,6 +219,12 @@ class Server:
         self._enable_security_headers = enable_security_headers
         self._hsts_max_age = hsts_max_age
         self._csp_policy = csp_policy or "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+        self._enable_rate_limiting = enable_rate_limiting
+        self._rate_limit_max = rate_limit_max
+        self._rate_limit_window = rate_limit_window
+        self._rate_limiter: Optional[RateLimiter] = (
+            RateLimiter(rate_limit_max, rate_limit_window) if enable_rate_limiting else None
+        )
         self._app: web.Application = web.Application()
         self._app_is_running: bool = False
         self._cap_routes: List[str,] = []
@@ -205,6 +270,8 @@ class Server:
 
     def __start_func(self) -> None:
         self._app.middlewares.append(_security_headers_middleware)
+        if self._enable_rate_limiting:
+            self._app.middlewares.append(_rate_limit_middleware)
         self._app._server_instance = self
         self._app.router.add_route("GET", "/", self.__root_handler)
         if self._audio_routes:
