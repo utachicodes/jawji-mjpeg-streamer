@@ -1,6 +1,7 @@
 import argparse
 import os
 import re
+import signal
 import ssl
 import time
 from pathlib import Path
@@ -367,13 +368,24 @@ def main() -> None:
         except Exception as e:
             print(f"Audio setup error: {e}")
 
+    # Signal handling for graceful shutdown
+    shutdown_requested = False
+    
+    def signal_handler(signum, frame):
+        nonlocal shutdown_requested
+        print(f"\nReceived signal {signum}, shutting down gracefully...")
+        shutdown_requested = True
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
     try:
         for stream in streams:
             stream.start()
         for astream in audio_streams:
             astream.start()
         server.start()
-        while True:
+        while not shutdown_requested:
             if args.show_bandwidth:
                 for stream in streams:
                     bandwidth[stream.name] = stream.get_bandwidth()
@@ -390,11 +402,13 @@ def main() -> None:
     except Exception as e:
         print("Error:", e)
     finally:
+        print("\nStopping streams...")
         for stream in streams:
             stream.stop()
         for astream in audio_streams:
             astream.stop()
         server.stop()
+        print("Shutdown complete.")
 
 
 if __name__ == "__main__":
