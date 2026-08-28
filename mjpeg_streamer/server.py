@@ -1,6 +1,6 @@
 import asyncio
 import threading
-from typing import List, Union
+from typing import List, Optional, Union
 
 import aiohttp
 from aiohttp import MultipartWriter, web
@@ -10,9 +10,26 @@ from multidict import MultiDict
 from .stream import AudioStream, StreamBase
 
 
+def _security_headers_middleware(app: web.Application, handler):
+    async def middleware_handler(request: web.Request) -> web.Response:
+        response = await handler(request)
+        if hasattr(app, "_server_instance") and app._server_instance._enable_security_headers:
+            server = app._server_instance
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["X-XSS-Protection"] = "1; mode=block"
+            response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+            response.headers["Content-Security-Policy"] = server._csp_policy
+            if request.url.scheme == "https":
+                response.headers["Strict-Transport-Security"] = f"max-age={server._hsts_max_age}; includeSubDomains"
+        return response
+    return middleware_handler
+
+
 class _StreamHandler:
-    def __init__(self, stream: StreamBase) -> None:
+    def __init__(self, stream: StreamBase, server: "Server") -> None:
         self._stream = stream
+        self._server = server
 
     async def __call__(self, request: web.Request) -> web.StreamResponse:
         viewer_token = request.cookies.get("viewer_token")
@@ -20,9 +37,18 @@ class _StreamHandler:
             status=200,
             reason="OK",
             headers={
-                "Content-Type": "multipart/x-mixed-replace;boundary=image-boundary"
+                "Content-Type": "multipart/x-mixed-replace;boundary=image-boundary",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
             },
         )
+        if self._server._enable_security_headers:
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Content-Security-Policy"] = self._server._csp_policy
+            if request.url.scheme == "https":
+                response.headers["Strict-Transport-Security"] = f"max-age={self._server._hsts_max_age}; includeSubDomains"
         try:
             await response.prepare(request)
         except (ConnectionResetError, ConnectionAbortedError, ConnectionError):
@@ -54,8 +80,9 @@ class _StreamHandler:
 
 
 class _AudioHandler:
-    def __init__(self, stream: AudioStream) -> None:
+    def __init__(self, stream: AudioStream, server: "Server") -> None:
         self._stream = stream
+        self._server = server
 
     async def __call__(self, request: web.Request) -> web.StreamResponse:
         viewer_token = request.cookies.get("viewer_token")
@@ -65,8 +92,16 @@ class _AudioHandler:
             headers={
                 "Content-Type": "audio/wav",
                 "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
             },
         )
+        if self._server._enable_security_headers:
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Content-Security-Policy"] = self._server._csp_policy
+            if request.url.scheme == "https":
+                response.headers["Strict-Transport-Security"] = f"max-age={self._server._hsts_max_age}; includeSubDomains"
         try:
             await response.prepare(request)
         except (ConnectionResetError, ConnectionAbortedError, ConnectionError):
@@ -103,7 +138,13 @@ class _AudioHandler:
 
 class Server:
     def __init__(
-        self, host: Union[str, List[str,]] = "localhost", port: int = 8080
+        self,
+        host: Union[str, List[str,]] = "localhost",
+        port: int = 8080,
+        *,
+        enable_security_headers: bool = True,
+        hsts_max_age: int = 31536000,
+        csp_policy: Optional[str] = None,
     ) -> None:
         if isinstance(host, str):
             self._host: List[str,] = [
@@ -116,6 +157,9 @@ class Server:
                 host.remove("localhost")
             self._host = list(set(host))
         self._port = port
+        self._enable_security_headers = enable_security_headers
+        self._hsts_max_age = hsts_max_age
+        self._csp_policy = csp_policy or "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
         self._app: web.Application = web.Application()
         self._app_is_running: bool = False
         self._cap_routes: List[str,] = []
@@ -148,18 +192,20 @@ class Server:
                     f"An audio stream with the name {route} already exists"
                 )
             self._audio_routes.append(route)
-            self._app.router.add_route("GET", route, _AudioHandler(stream))
+            self._app.router.add_route("GET", route, _AudioHandler(stream, self))
         else:
             if route in self._cap_routes:
                 raise ValueError(f"A stream with the name {route} already exists")
             self._cap_routes.append(route)
-            self._app.router.add_route("GET", route, _StreamHandler(stream))
+            self._app.router.add_route("GET", route, _StreamHandler(stream, self))
         if self._audio_routes:
             from .player import PlayerHandler
 
             self._app.router.add_route("GET", "/player", PlayerHandler(self))
 
     def __start_func(self) -> None:
+        self._app.middlewares.append(_security_headers_middleware)
+        self._app._server_instance = self
         self._app.router.add_route("GET", "/", self.__root_handler)
         if self._audio_routes:
             from .player import PlayerHandler
