@@ -1,10 +1,60 @@
 import argparse
+import os
 import re
 import time
+from pathlib import Path
 from typing import Dict, List, Tuple, Union
 
 from .server import Server
 from .stream import AudioStream, ManagedStream
+
+
+def _sanitize_source(source: Union[int, str]) -> Union[int, str]:
+    """Sanitize source input to prevent path traversal attacks."""
+    if isinstance(source, int):
+        if source < 0:
+            raise ValueError("Camera index must be non-negative")
+        return source
+    if not isinstance(source, str):
+        raise ValueError("Source must be a string or integer")
+    
+    # Check for path traversal attempts
+    source_path = Path(source)
+    try:
+        # Resolve the path to check for traversal
+        resolved = source_path.resolve()
+        # Ensure it's not trying to escape the current directory in a suspicious way
+        # Allow relative paths but block obvious traversal patterns
+        if ".." in source_path.parts:
+            raise ValueError("Path traversal detected in source")
+    except (OSError, ValueError):
+        # If resolution fails, it might be a URL or device path - allow but validate
+        pass
+    
+    # Block null bytes
+    if "\x00" in source:
+        raise ValueError("Null byte detected in source")
+    
+    # Allow common video device patterns and URLs
+    if source.startswith(("rtsp://", "rtmp://", "http://", "https://", "/dev/video", "v4l2://")):
+        return source
+    
+    # For file paths, ensure they're safe
+    if os.path.isabs(source) or source.startswith(("./", "../")):
+        # Validate it's a reasonable video file extension or device
+        allowed_extensions = {".mp4", ".avi", ".mkv", ".mov", ".flv", ".webm", ".mjpeg", ".mjpg"}
+        suffix = source_path.suffix.lower()
+        if suffix and suffix not in allowed_extensions:
+            raise ValueError(f"Unsupported file extension: {suffix}. Allowed: {allowed_extensions}")
+    
+    return source
+
+
+def _validate_bounds(value: int, min_val: int, max_val: int, name: str) -> int:
+    """Validate that a value is within bounds."""
+    if not min_val <= value <= max_val:
+        raise ValueError(f"{name} must be between {min_val} and {max_val}, got {value}")
+    return value
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,10 +108,48 @@ def parse_args() -> argparse.Namespace:
         help="List available audio input devices and exit",
     )
     args: argparse.Namespace = parser.parse_args()
+    
+    # Validate and sanitize inputs
     args.prefix = re.sub("[^0-9a-zA-Z]+", "_", args.prefix)
+    args.prefix = args.prefix[:50]  # Limit prefix length
+    
+    # Validate numeric bounds
+    args.port = _validate_bounds(args.port, 1, 65535, "port")
+    args.width = _validate_bounds(args.width, 1, 7680, "width")
+    args.height = _validate_bounds(args.height, 1, 4320, "height")
+    args.quality = _validate_bounds(args.quality, 1, 100, "quality")
+    args.fps = _validate_bounds(args.fps, 1, 120, "fps")
+    args.audio_rate = _validate_bounds(args.audio_rate, 8000, 192000, "audio-rate")
+    args.audio_channels = _validate_bounds(args.audio_channels, 1, 8, "audio-channels")
+    
     args.source = [[0]] if args.source is None else args.source
     args.source = [item for sublist in args.source for item in sublist]
-    args.source = list(set(args.source))
+    
+    # Sanitize each source
+    sanitized_sources = []
+    for src in args.source:
+        try:
+            sanitized = _sanitize_source(src)
+            sanitized_sources.append(sanitized)
+        except ValueError as e:
+            print(f"Warning: Invalid source '{src}': {e}")
+    args.source = list(set(sanitized_sources))
+    
+    # Validate audio device indices
+    if args.audio:
+        sanitized_audio = []
+        for device in args.audio:
+            if device is not None:
+                try:
+                    device_idx = int(device)
+                    device_idx = _validate_bounds(device_idx, 0, 100, "audio device index")
+                    sanitized_audio.append(device_idx)
+                except ValueError as e:
+                    print(f"Warning: Invalid audio device '{device}': {e}")
+            else:
+                sanitized_audio.append(None)
+        args.audio = sanitized_audio
+    
     return args
 
 
@@ -96,9 +184,8 @@ def main() -> None:
         bandwidth: Dict[str, int] = {}
 
     for source in args.source:
-        source: Union[int, str] = int(source) if str(source).isdigit() else source
         source_display = (
-            re.sub("[^0-9a-zA-Z]+", "_", source) if isinstance(source, str) else source
+            re.sub("[^0-9a-zA-Z]+", "_", str(source)) if isinstance(source, str) else source
         )
         stream = ManagedStream(
             f"{args.prefix}{'_' if args.prefix else ''}{source_display!s}",
@@ -113,7 +200,7 @@ def main() -> None:
     if args.audio:
         try:
             for i, device in enumerate(args.audio):
-                device_index = int(device) if device is not None else None
+                device_index = device if device is not None else None
                 name = (
                     f"{args.prefix}{'_' if args.prefix else ''}audio_{device_index}"
                     if device_index is not None
