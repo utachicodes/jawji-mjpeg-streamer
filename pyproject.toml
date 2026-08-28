@@ -23,7 +23,7 @@ keywords = [
 ]
 license = {text = "AGPLv3"}
 authors = [{name = "Ege Akman", email = "me@egeakman.dev"}]
-requires-python = ">=3.6"
+requires-python = ">=3.9"
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Environment :: Web Environment",
@@ -36,13 +36,11 @@ classifiers = [
   "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.6",
-  "Programming Language :: Python :: 3.7",
-  "Programming Language :: Python :: 3.8",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
   "Topic :: Multimedia :: Video",
   "Topic :: Security",
@@ -51,16 +49,9 @@ dynamic = [
   "version",
 ]
 dependencies = [
-  'aiohttp==3.8.6; python_version >= "3.6" and python_version <= "3.7"',
-  'aiohttp==3.9.1; python_version == "3.8"',
-  'aiohttp; python_version >= "3.9"',
-  'numpy==1.19.5; python_version == "3.6"',
-  'numpy==1.21.6; python_version == "3.7"',
-  'numpy==1.24.4; python_version == "3.8"',
-  'numpy; python_version >= "3.9"',
-  'opencv-python==4.6.0.66; python_version == "3.6"',
-  'opencv-python==4.8.1.78; python_version >= "3.7" and python_version <= "3.8"',
-  'opencv-python; python_version >= "3.9"',
+  'aiohttp>=3.9.0',
+  'numpy>=1.24.0',
+  'opencv-python>=4.8.0',
 ]
 [project.optional-dependencies]
 audio = [

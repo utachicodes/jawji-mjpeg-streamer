@@ -2,3 +2,8 @@ hatch
 mypy
 pre-commit
 ruff
+pytest
+pytest-asyncio
+hypothesis
+bandit
+pip-audit
