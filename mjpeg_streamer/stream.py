@@ -38,9 +38,9 @@ class StreamBase:
     async def _ensure_background_tasks(self) -> None:
         for task_name, task in self._tasks.items():
             if task is None or task.done():
-                self._tasks[task_name] = asyncio.create_task(
-                    eval(f"self.{task_name}()")
-                )
+                method = getattr(self, task_name, None)
+                if method and callable(method):
+                    self._tasks[task_name] = asyncio.create_task(method())
 
     async def _clear_bandwidth(self) -> None:
         while True:
@@ -361,9 +361,9 @@ class AudioStream:
     async def _ensure_background_tasks(self) -> None:
         for task_name, task in self._tasks.items():
             if task is None or task.done():
-                self._tasks[task_name] = asyncio.create_task(
-                    eval(f"self.{task_name}()")
-                )
+                method = getattr(self, task_name, None)
+                if method and callable(method):
+                    self._tasks[task_name] = asyncio.create_task(method())
 
     async def _capture_loop(self) -> None:
         """Background task that continuously reads audio from the device."""
