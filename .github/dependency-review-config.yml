@@ -1,0 +1,33 @@
+# Dependency Review Configuration
+# See: https://github.com/actions/dependency-review-action
+
+# Fail on high severity vulnerabilities
+fail-on-severity: high
+
+# Allow list for known false positives or accepted risks
+allow-ghsas:
+  # Example: GHSA-xxxx-xxxx-xxxx
+
+# Severity thresholds
+severity-thresholds:
+  critical: 0
+  high: 0
+  medium: 10
+  low: 50
+
+# License policy
+license-policy:
+  # Only allow OSI-approved licenses
+  allowed-licenses:
+    - MIT
+    - Apache-2.0
+    - BSD-2-Clause
+    - BSD-3-Clause
+    - ISC
+    - PSF-2.0
+    - LGPL-2.1-only
+    - LGPL-3.0-only
+  # Deny specific licenses
+  denied-licenses:
+    - GPL-3.0-only
+    - AGPL-3.0-only

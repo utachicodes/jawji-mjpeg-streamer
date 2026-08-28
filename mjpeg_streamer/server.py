@@ -1,6 +1,11 @@
 import asyncio
+import hmac
+import ssl
 import threading
-from typing import List, Union
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import List, Optional, Union
 
 import aiohttp
 from aiohttp import MultipartWriter, web
@@ -10,9 +15,177 @@ from multidict import MultiDict
 from .stream import AudioStream, StreamBase
 
 
+class RateLimiter:
+    """Simple token bucket rate limiter per IP (in-memory)."""
+    
+    def __init__(self, max_requests: int = 100, window_seconds: int = 60) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._requests: defaultdict[str, List[float]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+    
+    async def is_allowed(self, client_ip: str) -> bool:
+        async with self._lock:
+            now = time.time()
+            # Clean old requests
+            self._requests[client_ip] = [
+                req_time for req_time in self._requests[client_ip]
+                if now - req_time < self.window_seconds
+            ]
+            if len(self._requests[client_ip]) >= self.max_requests:
+                return False
+            self._requests[client_ip].append(now)
+            return True
+    
+    def get_remaining(self, client_ip: str) -> int:
+        now = time.time()
+        recent = [
+            req_time for req_time in self._requests[client_ip]
+            if now - req_time < self.window_seconds
+        ]
+        return max(0, self.max_requests - len(recent))
+
+
+class RedisRateLimiter:
+    """Redis-backed rate limiter for distributed deployments (Upstash compatible)."""
+    
+    def __init__(self, max_requests: int = 100, window_seconds: int = 60, redis_url: Optional[str] = None) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._redis_url = redis_url
+        self._redis = None
+        self._local_fallback = RateLimiter(max_requests, window_seconds)
+        self._use_redis = False
+    
+    async def _ensure_redis(self) -> None:
+        if self._redis is None and self._redis_url:
+            try:
+                import redis.asyncio as redis
+                self._redis = redis.from_url(self._redis_url, decode_responses=True)
+                await self._redis.ping()
+                self._use_redis = True
+            except Exception:
+                # Fall back to local rate limiter
+                self._use_redis = False
+                self._redis = None
+    
+    async def is_allowed(self, client_ip: str) -> bool:
+        await self._ensure_redis()
+        if self._use_redis and self._redis:
+            try:
+                key = f"ratelimit:{client_ip}"
+                pipe = self._redis.pipeline()
+                now = time.time()
+                window_start = now - self.window_seconds
+                
+                # Remove old entries
+                pipe.zremrangebyscore(key, 0, window_start)
+                # Count current requests
+                pipe.zcard(key)
+                # Add current request
+                pipe.zadd(key, {f"{now}:{id(client_ip)}": now})
+                # Set expiry
+                pipe.expire(key, self.window_seconds + 1)
+                results = await pipe.execute()
+                
+                current_count = results[1]
+                if current_count >= self.max_requests:
+                    return False
+                return True
+            except Exception:
+                # Fall back to local
+                return await self._local_fallback.is_allowed(client_ip)
+        return await self._local_fallback.is_allowed(client_ip)
+    
+    def get_remaining(self, client_ip: str) -> int:
+        # For Redis, we'd need async, so just use local for remaining
+        return self._local_fallback.get_remaining(client_ip)
+    
+    async def close(self) -> None:
+        if self._redis:
+            await self._redis.close()
+            self._redis = None
+            self._use_redis = False
+
+
+def _security_headers_middleware(app: web.Application, handler):
+    async def middleware_handler(request: web.Request) -> web.Response:
+        response = await handler(request)
+        if hasattr(app, "_server_instance") and app._server_instance._enable_security_headers:
+            server = app._server_instance
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["X-XSS-Protection"] = "1; mode=block"
+            response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+            response.headers["Content-Security-Policy"] = server._csp_policy
+            if request.url.scheme == "https":
+                response.headers["Strict-Transport-Security"] = f"max-age={server._hsts_max_age}; includeSubDomains"
+        return response
+    return middleware_handler
+
+
+def _rate_limit_middleware(app: web.Application, handler):
+    async def middleware_handler(request: web.Request) -> web.Response:
+        if hasattr(app, "_server_instance") and app._server_instance._rate_limiter:
+            server = app._server_instance
+            client_ip = request.remote or "unknown"
+            if not await server._rate_limiter.is_allowed(client_ip):
+                return web.Response(
+                    status=429,
+                    text="Rate limit exceeded",
+                    headers={
+                        "Retry-After": str(server._rate_limit_window),
+                        "X-RateLimit-Limit": str(server._rate_limit_max),
+                        "X-RateLimit-Remaining": "0",
+                    }
+                )
+            response = await handler(request)
+            response.headers["X-RateLimit-Limit"] = str(server._rate_limit_max)
+            response.headers["X-RateLimit-Remaining"] = str(server._rate_limiter.get_remaining(client_ip))
+            return response
+        return await handler(request)
+    return middleware_handler
+
+
+def _auth_middleware(app: web.Application, handler):
+    async def middleware_handler(request: web.Request) -> web.Response:
+        if hasattr(app, "_server_instance"):
+            server = app._server_instance
+            if server._auth_token:
+                # Skip auth for root and player page
+                if request.path in ("/", "/player"):
+                    return await handler(request)
+                
+                auth_header = request.headers.get(server._auth_header, "")
+                # Support Bearer token format
+                if auth_header.startswith("Bearer "):
+                    token = auth_header[7:]
+                else:
+                    token = auth_header
+                
+                # Reject query parameter tokens (security: tokens in URLs are logged)
+                if "token" in request.query:
+                    return web.Response(
+                        status=401,
+                        text="Unauthorized: Token in query parameter not allowed",
+                        headers={"WWW-Authenticate": f'Bearer realm="mjpeg-streamer"'}
+                    )
+                
+                # Timing-safe comparison to prevent timing attacks
+                if not token or not hmac.compare_digest(token, server._auth_token):
+                    return web.Response(
+                        status=401,
+                        text="Unauthorized: Invalid or missing token",
+                        headers={"WWW-Authenticate": f'Bearer realm="mjpeg-streamer"'}
+                    )
+        return await handler(request)
+    return middleware_handler
+
+
 class _StreamHandler:
-    def __init__(self, stream: StreamBase) -> None:
+    def __init__(self, stream: StreamBase, server: "Server") -> None:
         self._stream = stream
+        self._server = server
 
     async def __call__(self, request: web.Request) -> web.StreamResponse:
         viewer_token = request.cookies.get("viewer_token")
@@ -20,9 +193,18 @@ class _StreamHandler:
             status=200,
             reason="OK",
             headers={
-                "Content-Type": "multipart/x-mixed-replace;boundary=image-boundary"
+                "Content-Type": "multipart/x-mixed-replace;boundary=image-boundary",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
             },
         )
+        if self._server._enable_security_headers:
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Content-Security-Policy"] = self._server._csp_policy
+            if request.url.scheme == "https":
+                response.headers["Strict-Transport-Security"] = f"max-age={self._server._hsts_max_age}; includeSubDomains"
         try:
             await response.prepare(request)
         except (ConnectionResetError, ConnectionAbortedError, ConnectionError):
@@ -54,8 +236,9 @@ class _StreamHandler:
 
 
 class _AudioHandler:
-    def __init__(self, stream: AudioStream) -> None:
+    def __init__(self, stream: AudioStream, server: "Server") -> None:
         self._stream = stream
+        self._server = server
 
     async def __call__(self, request: web.Request) -> web.StreamResponse:
         viewer_token = request.cookies.get("viewer_token")
@@ -65,8 +248,16 @@ class _AudioHandler:
             headers={
                 "Content-Type": "audio/wav",
                 "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
             },
         )
+        if self._server._enable_security_headers:
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Content-Security-Policy"] = self._server._csp_policy
+            if request.url.scheme == "https":
+                response.headers["Strict-Transport-Security"] = f"max-age={self._server._hsts_max_age}; includeSubDomains"
         try:
             await response.prepare(request)
         except (ConnectionResetError, ConnectionAbortedError, ConnectionError):
@@ -103,7 +294,24 @@ class _AudioHandler:
 
 class Server:
     def __init__(
-        self, host: Union[str, List[str,]] = "localhost", port: int = 8080
+        self,
+        host: Union[str, List[str,]] = "localhost",
+        port: int = 8080,
+        *,
+        enable_security_headers: bool = True,
+        hsts_max_age: int = 31536000,
+        csp_policy: Optional[str] = None,
+        enable_rate_limiting: bool = False,
+        rate_limit_max: int = 100,
+        rate_limit_window: int = 60,
+        rate_limit_redis_url: Optional[str] = None,
+        auth_token: Optional[str] = None,
+        auth_header: str = "Authorization",
+        ssl_certfile: Optional[str] = None,
+        ssl_keyfile: Optional[str] = None,
+        ssl_password: Optional[str] = None,
+        ssl_ca_certs: Optional[str] = None,
+        ssl_verify_mode: int = ssl.CERT_NONE,
     ) -> None:
         if isinstance(host, str):
             self._host: List[str,] = [
@@ -116,26 +324,66 @@ class Server:
                 host.remove("localhost")
             self._host = list(set(host))
         self._port = port
+        self._enable_security_headers = enable_security_headers
+        self._hsts_max_age = hsts_max_age
+        self._csp_policy = csp_policy or "default-src 'none'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+        self._enable_rate_limiting = enable_rate_limiting
+        self._rate_limit_max = rate_limit_max
+        self._rate_limit_window = rate_limit_window
+        self._rate_limit_redis_url = rate_limit_redis_url
+        if enable_rate_limiting:
+            if rate_limit_redis_url:
+                self._rate_limiter: Optional[RateLimiter] = RedisRateLimiter(rate_limit_max, rate_limit_window, rate_limit_redis_url)
+            else:
+                self._rate_limiter = RateLimiter(rate_limit_max, rate_limit_window)
+        else:
+            self._rate_limiter = None
+        self._auth_token = auth_token
+        self._auth_header = auth_header
+        self._ssl_certfile = ssl_certfile
+        self._ssl_keyfile = ssl_keyfile
+        self._ssl_password = ssl_password
+        self._ssl_ca_certs = ssl_ca_certs
+        self._ssl_verify_mode = ssl_verify_mode
+        self._ssl_context: Optional[ssl.SSLContext] = None
+        if ssl_certfile and ssl_keyfile:
+            self._ssl_context = self._create_ssl_context()
         self._app: web.Application = web.Application()
         self._app_is_running: bool = False
         self._cap_routes: List[str,] = []
         self._audio_routes: List[str] = []
 
+    def _create_ssl_context(self) -> ssl.SSLContext:
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_cert_chain(
+            certfile=self._ssl_certfile,
+            keyfile=self._ssl_keyfile,
+            password=self._ssl_password,
+        )
+        if self._ssl_ca_certs:
+            context.load_verify_locations(cafile=self._ssl_ca_certs)
+            context.verify_mode = self._ssl_verify_mode
+        # Modern security settings
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
+        return context
+
     def is_running(self) -> bool:
         return self._app_is_running
 
     async def __root_handler(self, _) -> web.Response:
+        scheme = "https" if self._ssl_context else "http"
         text = "<h2>Available streams:</h2>"
         for route in self._cap_routes:
-            text += f"<a href='http://{self._host[0]}:{self._port}{route}'>{route}</a>\n<br>\n"
+            text += f"<a href='{scheme}://{self._host[0]}:{self._port}{route}'>{route}</a>\n<br>\n"
         if self._audio_routes:
             text += "<h2>Audio streams:</h2>"
             for route in self._audio_routes:
-                text += f"<a href='http://{self._host[0]}:{self._port}{route}'>{route}</a>\n<br>\n"
+                text += f"<a href='{scheme}://{self._host[0]}:{self._port}{route}'>{route}</a>\n<br>\n"
         if self._cap_routes and self._audio_routes:
-            text += f"<h2><a href='http://{self._host[0]}:{self._port}/player'>Player (synced audio+video)</a></h2>"
+            text += f"<h2><a href='{scheme}://{self._host[0]}:{self._port}/player'>Player (synced audio+video)</a></h2>"
         elif self._audio_routes:
-            text += f"<h2><a href='http://{self._host[0]}:{self._port}/player'>Player</a></h2>"
+            text += f"<h2><a href='{scheme}://{self._host[0]}:{self._port}/player'>Player</a></h2>"
         return aiohttp.web.Response(text=text, content_type="text/html")
 
     def add_stream(self, stream: Union[StreamBase, AudioStream]) -> None:
@@ -148,18 +396,24 @@ class Server:
                     f"An audio stream with the name {route} already exists"
                 )
             self._audio_routes.append(route)
-            self._app.router.add_route("GET", route, _AudioHandler(stream))
+            self._app.router.add_route("GET", route, _AudioHandler(stream, self))
         else:
             if route in self._cap_routes:
                 raise ValueError(f"A stream with the name {route} already exists")
             self._cap_routes.append(route)
-            self._app.router.add_route("GET", route, _StreamHandler(stream))
+            self._app.router.add_route("GET", route, _StreamHandler(stream, self))
         if self._audio_routes:
             from .player import PlayerHandler
 
             self._app.router.add_route("GET", "/player", PlayerHandler(self))
 
     def __start_func(self) -> None:
+        self._app.middlewares.append(_security_headers_middleware)
+        if self._enable_rate_limiting:
+            self._app.middlewares.append(_rate_limit_middleware)
+        if self._auth_token:
+            self._app.middlewares.append(_auth_middleware)
+        self._app._server_instance = self
         self._app.router.add_route("GET", "/", self.__root_handler)
         if self._audio_routes:
             from .player import PlayerHandler
@@ -169,7 +423,7 @@ class Server:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(runner.setup())
-        site = web.TCPSite(runner, self._host, self._port)
+        site = web.TCPSite(runner, self._host, self._port, ssl_context=self._ssl_context)
         loop.run_until_complete(site.start())
         loop.run_forever()
 
@@ -181,16 +435,17 @@ class Server:
         else:
             print("\nServer is already running\n")
 
+        scheme = "https" if self._ssl_context else "http"
         for addr in self._host:
-            print(f"\nStreams index: http://{addr}:{self._port!s}")
+            print(f"\nStreams index: {scheme}://{addr}:{self._port!s}")
             print("Available streams:\n")
             for route in self._cap_routes:  # route has a leading slash
-                print(f"http://{addr}:{self._port!s}{route}")
+                print(f"{scheme}://{addr}:{self._port!s}{route}")
             if self._audio_routes:
                 print("\nAudio streams:\n")
                 for route in self._audio_routes:
-                    print(f"http://{addr}:{self._port!s}{route}")
-                print(f"\nPlayer: http://{addr}:{self._port!s}/player")
+                    print(f"{scheme}://{addr}:{self._port!s}{route}")
+                print(f"\nPlayer: {scheme}://{addr}:{self._port!s}/player")
             print("--------------------------------\n")
         print("\nPress Ctrl+C to stop the server\n")
 
@@ -198,6 +453,14 @@ class Server:
         if self.is_running():
             self._app_is_running = False
             print("\nStopping...\n")
+            # Close Redis connection if using Redis rate limiter
+            if self._rate_limiter and hasattr(self._rate_limiter, 'close'):
+                import asyncio
+                try:
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(self._rate_limiter.close())
+                except Exception:
+                    pass
             GracefulExit()
             print("\nServer stopped\n")
         else:

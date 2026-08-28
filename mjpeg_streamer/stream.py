@@ -18,29 +18,63 @@ except ImportError:
 
 
 class StreamBase:
+    # Maximum frame size to prevent DoS (10MB)
+    MAX_FRAME_SIZE = 10 * 1024 * 1024
+    # Maximum dimensions
+    MAX_WIDTH = 7680
+    MAX_HEIGHT = 4320
+    # Maximum FPS
+    MAX_FPS = 120
+    # Minimum FPS
+    MIN_FPS = 1
+
     def __init__(
         self,
         name: str,
         fps: int = 30,
     ) -> None:
         self.name = name.casefold().replace(" ", "_")
-        self.fps = fps
+        self.fps = self._validate_fps(fps)
         self._frame: np.ndarray = np.zeros((320, 240, 1), dtype=np.uint8)
         self._last_processed_frame: np.ndarray = cv2.imencode(
             ".jpg", self._frame, [cv2.IMWRITE_JPEG_QUALITY, 1]
         )[1]
         self._lock: asyncio.Lock = asyncio.Lock()
-        self._frames_buffer: Deque[int] = deque(maxlen=fps)
+        self._frames_buffer: Deque[int] = deque(maxlen=self.fps)
         self._bandwidth_last_modified_time: float = time.time()
         self._active_viewers: Set[str] = set()
         self._tasks: Dict[str, asyncio.Task] = {"_clear_bandwidth": None}
 
+    @classmethod
+    def _validate_fps(cls, fps: int) -> int:
+        if not cls.MIN_FPS <= fps <= cls.MAX_FPS:
+            raise ValueError(f"FPS must be between {cls.MIN_FPS} and {cls.MAX_FPS}, got {fps}")
+        return fps
+
+    @classmethod
+    def _validate_dimensions(cls, width: int, height: int) -> Tuple[int, int]:
+        if not 1 <= width <= cls.MAX_WIDTH:
+            raise ValueError(f"Width must be between 1 and {cls.MAX_WIDTH}, got {width}")
+        if not 1 <= height <= cls.MAX_HEIGHT:
+            raise ValueError(f"Height must be between 1 and {cls.MAX_HEIGHT}, got {height}")
+        return width, height
+
+    @classmethod
+    def _validate_frame_size(cls, frame: np.ndarray) -> None:
+        """Validate frame size to prevent DoS."""
+        frame_bytes = frame.tobytes()
+        if len(frame_bytes) > cls.MAX_FRAME_SIZE:
+            raise ValueError(
+                f"Frame size {len(frame_bytes)} bytes exceeds maximum allowed "
+                f"{cls.MAX_FRAME_SIZE} bytes"
+            )
+
     async def _ensure_background_tasks(self) -> None:
         for task_name, task in self._tasks.items():
             if task is None or task.done():
-                self._tasks[task_name] = asyncio.create_task(
-                    eval(f"self.{task_name}()")
-                )
+                method = getattr(self, task_name, None)
+                if method and callable(method):
+                    self._tasks[task_name] = asyncio.create_task(method())
 
     async def _clear_bandwidth(self) -> None:
         while True:
@@ -83,6 +117,10 @@ class StreamBase:
     async def _resize_and_encode_frame(
         self, frame: np.ndarray, size: Tuple[int, int], quality: int
     ) -> np.ndarray:
+        # Validate input dimensions
+        width, height = size
+        self._validate_dimensions(width, height)
+        
         resized_frame = cv2.resize(frame, size)
         if not await self.__check_encoding(resized_frame) == "jpg":
             val, encoded_frame = cv2.imencode(
@@ -92,6 +130,8 @@ class StreamBase:
             raise ValueError(
                 f"Error encoding frame. Format/shape: {await self.__check_encoding(resized_frame)}"
             )
+        # Validate output frame size
+        self._validate_frame_size(encoded_frame)
         return encoded_frame
 
     def settings(self) -> None:
@@ -123,6 +163,7 @@ class StreamBase:
             return await self._process_current_frame()
 
     def set_frame(self, frame: np.ndarray) -> None:
+        self._validate_frame_size(frame)
         self._frame = frame
 
 
@@ -135,9 +176,18 @@ class Stream(StreamBase):
         quality: int = 50,
     ) -> None:
         super().__init__(name, fps)
-        self.size = size
-        self.quality = max(1, min(quality, 100))
+        if size:
+            self.size = self._validate_dimensions(*size)
+        else:
+            self.size = None
+        self.quality = self._validate_quality(quality)
         self._last_processed_frame: np.ndarray = np.zeros((320, 240, 1), dtype=np.uint8)
+
+    @staticmethod
+    def _validate_quality(quality: int) -> int:
+        if not 1 <= quality <= 100:
+            raise ValueError(f"Quality must be between 1 and 100, got {quality}")
+        return quality
 
     async def _process_current_frame(self) -> np.ndarray:
         frame = await self._resize_and_encode_frame(
@@ -149,10 +199,10 @@ class Stream(StreamBase):
         return frame
 
     def set_size(self, size: Tuple[int, int]) -> None:
-        self.size = size
+        self.size = self._validate_dimensions(*size)
 
     def set_quality(self, quality: int) -> None:
-        self.quality = max(1, min(quality, 100))
+        self.quality = self._validate_quality(quality)
 
 
 class ManagedStream(StreamBase):
@@ -172,13 +222,22 @@ class ManagedStream(StreamBase):
         self._available_modes: List[str,] = ["fast-on-demand", "full-on-demand"]
         if self.mode not in self._available_modes:
             raise ValueError(f"Invalid mode. Available modes: {self._available_modes}")
-        self.size = size
-        self.quality = max(1, min(quality, 100))
+        if size:
+            self.size = self._validate_dimensions(*size)
+        else:
+            self.size = None
+        self.quality = self._validate_quality(quality)
         self.poll_delay_seconds = poll_delay_ms / 1000.0 if poll_delay_ms else 1.0 / fps
         self._cap_is_open: bool = False
         self._cap: cv2.VideoCapture = None
         self._is_running: bool = False
         self._tasks["_manage_cap_state"] = None
+
+    @staticmethod
+    def _validate_quality(quality: int) -> int:
+        if not 1 <= quality <= 100:
+            raise ValueError(f"Quality must be between 1 and 100, got {quality}")
+        return quality
 
     async def _manage_cap_state(self) -> None:
         while True:
@@ -238,10 +297,10 @@ class ManagedStream(StreamBase):
         return await super()._get_frame()
 
     def set_size(self, size: Tuple[int, int]) -> None:
-        self.size = size
+        self.size = self._validate_dimensions(*size)
 
     def set_quality(self, quality: int) -> None:
-        self.quality = max(1, min(quality, 100))
+        self.quality = self._validate_quality(quality)
 
     def set_frame(self, frame: np.ndarray) -> None:
         raise NotImplementedError(
@@ -361,9 +420,9 @@ class AudioStream:
     async def _ensure_background_tasks(self) -> None:
         for task_name, task in self._tasks.items():
             if task is None or task.done():
-                self._tasks[task_name] = asyncio.create_task(
-                    eval(f"self.{task_name}()")
-                )
+                method = getattr(self, task_name, None)
+                if method and callable(method):
+                    self._tasks[task_name] = asyncio.create_task(method())
 
     async def _capture_loop(self) -> None:
         """Background task that continuously reads audio from the device."""
