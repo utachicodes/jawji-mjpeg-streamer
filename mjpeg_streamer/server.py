@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import ssl
 import threading
 import time
@@ -100,11 +101,16 @@ def _auth_middleware(app: web.Application, handler):
                 else:
                     token = auth_header
                 
-                # Also check query parameter for convenience (e.g., for <img> tags)
-                if not token:
-                    token = request.query.get("token", "")
+                # Reject query parameter tokens (security: tokens in URLs are logged)
+                if "token" in request.query:
+                    return web.Response(
+                        status=401,
+                        text="Unauthorized: Token in query parameter not allowed",
+                        headers={"WWW-Authenticate": f'Bearer realm="mjpeg-streamer"'}
+                    )
                 
-                if token != server._auth_token:
+                # Timing-safe comparison to prevent timing attacks
+                if not token or not hmac.compare_digest(token, server._auth_token):
                     return web.Response(
                         status=401,
                         text="Unauthorized: Invalid or missing token",

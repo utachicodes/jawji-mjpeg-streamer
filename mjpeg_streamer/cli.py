@@ -159,7 +159,7 @@ def parse_args() -> argparse.Namespace:
         "--auth-token",
         type=str,
         default=None,
-        help="Authentication token for streams (optional). If set, clients must provide this token via Authorization header or ?token= query parameter.",
+        help="Authentication token for streams (optional). If set, clients must provide this token via Authorization header (Bearer token). Query parameter tokens are rejected for security.",
     )
     parser.add_argument(
         "--auth-header",
