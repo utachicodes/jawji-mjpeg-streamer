@@ -11,7 +11,7 @@ from .stream import AudioStream, ManagedStream
 
 
 def _sanitize_source(source: Union[int, str]) -> Union[int, str]:
-    """Sanitize source input to prevent path traversal attacks."""
+    """Sanitize source input to prevent path traversal and SSRF attacks."""
     if isinstance(source, int):
         if source < 0:
             raise ValueError("Camera index must be non-negative")
@@ -36,8 +36,12 @@ def _sanitize_source(source: Union[int, str]) -> Union[int, str]:
     if "\x00" in source:
         raise ValueError("Null byte detected in source")
     
-    # Allow common video device patterns and URLs
-    if source.startswith(("rtsp://", "rtmp://", "http://", "https://", "/dev/video", "v4l2://")):
+    # Validate URL sources to prevent SSRF
+    if source.startswith(("rtsp://", "rtmp://", "http://", "https://")):
+        return _validate_url_source(source)
+    
+    # Allow common video device patterns
+    if source.startswith(("/dev/video", "v4l2://")):
         return source
     
     # For file paths, ensure they're safe
@@ -49,6 +53,49 @@ def _sanitize_source(source: Union[int, str]) -> Union[int, str]:
             raise ValueError(f"Unsupported file extension: {suffix}. Allowed: {allowed_extensions}")
     
     return source
+
+
+def _validate_url_source(url: str) -> str:
+    """Validate URL source to prevent SSRF attacks."""
+    from urllib.parse import urlparse
+    
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        raise ValueError(f"Invalid URL: {e}")
+    
+    # Only allow specific schemes
+    allowed_schemes = {"rtsp", "rtmp", "http", "https"}
+    if parsed.scheme not in allowed_schemes:
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme}. Allowed: {allowed_schemes}")
+    
+    # Block private IP addresses (RFC 1918) to prevent SSRF
+    hostname = parsed.hostname
+    if hostname:
+        import ipaddress
+        try:
+            ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            # Not an IP address, could be a hostname - allow but could add DNS resolution check
+            pass
+        else:
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+                raise ValueError(f"Access to private/internal IP addresses is blocked: {hostname}")
+    
+    # Block localhost and local hostnames
+    if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        raise ValueError(f"Access to localhost is blocked: {hostname}")
+    
+    # Block metadata service IPs (cloud provider metadata endpoints)
+    metadata_ips = {
+        "169.254.169.254",  # AWS, GCP, Azure, DigitalOcean
+        "169.254.169.253",  # Azure
+        "169.254.169.123",  # GCP
+    }
+    if hostname in metadata_ips:
+        raise ValueError(f"Access to metadata service IP is blocked: {hostname}")
+    
+    return url
 
 
 def _validate_bounds(value: int, min_val: int, max_val: int, name: str) -> int:
