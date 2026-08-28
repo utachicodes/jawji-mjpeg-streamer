@@ -1,6 +1,7 @@
 import argparse
 import os
 import re
+import ssl
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
@@ -131,6 +132,36 @@ def parse_args() -> argparse.Namespace:
         default=60,
         help="Rate limit window in seconds (default: 60)",
     )
+    parser.add_argument(
+        "--ssl-certfile",
+        type=str,
+        default=None,
+        help="Path to SSL certificate file (PEM format). Enables HTTPS.",
+    )
+    parser.add_argument(
+        "--ssl-keyfile",
+        type=str,
+        default=None,
+        help="Path to SSL private key file (PEM format). Required with --ssl-certfile.",
+    )
+    parser.add_argument(
+        "--ssl-password",
+        type=str,
+        default=None,
+        help="Password for SSL private key (if encrypted).",
+    )
+    parser.add_argument(
+        "--ssl-ca-certs",
+        type=str,
+        default=None,
+        help="Path to CA certificates file for client verification (optional).",
+    )
+    parser.add_argument(
+        "--ssl-verify-mode",
+        type=int,
+        default=ssl.CERT_NONE,
+        help="SSL verify mode: 0=CERT_NONE, 1=CERT_OPTIONAL, 2=CERT_REQUIRED (default: 0).",
+    )
     args: argparse.Namespace = parser.parse_args()
     
     # Validate and sanitize inputs
@@ -157,6 +188,20 @@ def parse_args() -> argparse.Namespace:
         # Only allow alphanumeric and common safe characters
         if not re.match(r"^[a-zA-Z0-9._-]+$", args.auth_token):
             raise ValueError("Auth token can only contain alphanumeric characters, dots, underscores, and hyphens")
+    
+    # Validate SSL arguments
+    if args.ssl_certfile and not args.ssl_keyfile:
+        raise ValueError("--ssl-keyfile is required when --ssl-certfile is provided")
+    if args.ssl_keyfile and not args.ssl_certfile:
+        raise ValueError("--ssl-certfile is required when --ssl-keyfile is provided")
+    if args.ssl_certfile and not os.path.isfile(args.ssl_certfile):
+        raise ValueError(f"SSL certificate file not found: {args.ssl_certfile}")
+    if args.ssl_keyfile and not os.path.isfile(args.ssl_keyfile):
+        raise ValueError(f"SSL key file not found: {args.ssl_keyfile}")
+    if args.ssl_ca_certs and not os.path.isfile(args.ssl_ca_certs):
+        raise ValueError(f"SSL CA certificates file not found: {args.ssl_ca_certs}")
+    if not 0 <= args.ssl_verify_mode <= 2:
+        raise ValueError("SSL verify mode must be 0 (CERT_NONE), 1 (CERT_OPTIONAL), or 2 (CERT_REQUIRED)")
     
     args.source = [[0]] if args.source is None else args.source
     args.source = [item for sublist in args.source for item in sublist]
@@ -222,6 +267,11 @@ def main() -> None:
         enable_rate_limiting=args.rate_limit > 0,
         rate_limit_max=args.rate_limit,
         rate_limit_window=args.rate_limit_window,
+        ssl_certfile=args.ssl_certfile,
+        ssl_keyfile=args.ssl_keyfile,
+        ssl_password=args.ssl_password,
+        ssl_ca_certs=args.ssl_ca_certs,
+        ssl_verify_mode=args.ssl_verify_mode,
     )
 
     if args.show_bandwidth:

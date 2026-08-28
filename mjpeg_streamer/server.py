@@ -1,7 +1,9 @@
 import asyncio
+import ssl
 import threading
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import List, Optional, Union
 
 import aiohttp
@@ -236,6 +238,11 @@ class Server:
         rate_limit_window: int = 60,
         auth_token: Optional[str] = None,
         auth_header: str = "Authorization",
+        ssl_certfile: Optional[str] = None,
+        ssl_keyfile: Optional[str] = None,
+        ssl_password: Optional[str] = None,
+        ssl_ca_certs: Optional[str] = None,
+        ssl_verify_mode: int = ssl.CERT_NONE,
     ) -> None:
         if isinstance(host, str):
             self._host: List[str,] = [
@@ -250,7 +257,7 @@ class Server:
         self._port = port
         self._enable_security_headers = enable_security_headers
         self._hsts_max_age = hsts_max_age
-        self._csp_policy = csp_policy or "default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+        self._csp_policy = csp_policy or "default-src 'none'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
         self._enable_rate_limiting = enable_rate_limiting
         self._rate_limit_max = rate_limit_max
         self._rate_limit_window = rate_limit_window
@@ -259,26 +266,50 @@ class Server:
         )
         self._auth_token = auth_token
         self._auth_header = auth_header
+        self._ssl_certfile = ssl_certfile
+        self._ssl_keyfile = ssl_keyfile
+        self._ssl_password = ssl_password
+        self._ssl_ca_certs = ssl_ca_certs
+        self._ssl_verify_mode = ssl_verify_mode
+        self._ssl_context: Optional[ssl.SSLContext] = None
+        if ssl_certfile and ssl_keyfile:
+            self._ssl_context = self._create_ssl_context()
         self._app: web.Application = web.Application()
         self._app_is_running: bool = False
         self._cap_routes: List[str,] = []
         self._audio_routes: List[str] = []
 
+    def _create_ssl_context(self) -> ssl.SSLContext:
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_cert_chain(
+            certfile=self._ssl_certfile,
+            keyfile=self._ssl_keyfile,
+            password=self._ssl_password,
+        )
+        if self._ssl_ca_certs:
+            context.load_verify_locations(cafile=self._ssl_ca_certs)
+            context.verify_mode = self._ssl_verify_mode
+        # Modern security settings
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
+        return context
+
     def is_running(self) -> bool:
         return self._app_is_running
 
     async def __root_handler(self, _) -> web.Response:
+        scheme = "https" if self._ssl_context else "http"
         text = "<h2>Available streams:</h2>"
         for route in self._cap_routes:
-            text += f"<a href='http://{self._host[0]}:{self._port}{route}'>{route}</a>\n<br>\n"
+            text += f"<a href='{scheme}://{self._host[0]}:{self._port}{route}'>{route}</a>\n<br>\n"
         if self._audio_routes:
             text += "<h2>Audio streams:</h2>"
             for route in self._audio_routes:
-                text += f"<a href='http://{self._host[0]}:{self._port}{route}'>{route}</a>\n<br>\n"
+                text += f"<a href='{scheme}://{self._host[0]}:{self._port}{route}'>{route}</a>\n<br>\n"
         if self._cap_routes and self._audio_routes:
-            text += f"<h2><a href='http://{self._host[0]}:{self._port}/player'>Player (synced audio+video)</a></h2>"
+            text += f"<h2><a href='{scheme}://{self._host[0]}:{self._port}/player'>Player (synced audio+video)</a></h2>"
         elif self._audio_routes:
-            text += f"<h2><a href='http://{self._host[0]}:{self._port}/player'>Player</a></h2>"
+            text += f"<h2><a href='{scheme}://{self._host[0]}:{self._port}/player'>Player</a></h2>"
         return aiohttp.web.Response(text=text, content_type="text/html")
 
     def add_stream(self, stream: Union[StreamBase, AudioStream]) -> None:
@@ -318,7 +349,7 @@ class Server:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(runner.setup())
-        site = web.TCPSite(runner, self._host, self._port)
+        site = web.TCPSite(runner, self._host, self._port, ssl_context=self._ssl_context)
         loop.run_until_complete(site.start())
         loop.run_forever()
 
@@ -330,16 +361,17 @@ class Server:
         else:
             print("\nServer is already running\n")
 
+        scheme = "https" if self._ssl_context else "http"
         for addr in self._host:
-            print(f"\nStreams index: http://{addr}:{self._port!s}")
+            print(f"\nStreams index: {scheme}://{addr}:{self._port!s}")
             print("Available streams:\n")
             for route in self._cap_routes:  # route has a leading slash
-                print(f"http://{addr}:{self._port!s}{route}")
+                print(f"{scheme}://{addr}:{self._port!s}{route}")
             if self._audio_routes:
                 print("\nAudio streams:\n")
                 for route in self._audio_routes:
-                    print(f"http://{addr}:{self._port!s}{route}")
-                print(f"\nPlayer: http://{addr}:{self._port!s}/player")
+                    print(f"{scheme}://{addr}:{self._port!s}{route}")
+                print(f"\nPlayer: {scheme}://{addr}:{self._port!s}/player")
             print("--------------------------------\n")
         print("\nPress Ctrl+C to stop the server\n")
 
