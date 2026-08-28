@@ -1,9 +1,15 @@
 from aiohttp import web
+import html
 
 
 class PlayerHandler:
     def __init__(self, server) -> None:
         self._server = server
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        """Escape HTML special characters to prevent XSS."""
+        return html.escape(text, quote=True)
 
     async def __call__(self, request: web.Request) -> web.Response:
         video_streams = self._server._cap_routes
@@ -14,11 +20,11 @@ class PlayerHandler:
         has_audio = len(audio_streams) > 0
 
         video_options = "\n".join(
-            f'<option value="http://{host}:{port}{r}">{r.lstrip("/")}</option>'
+            f'<option value="http://{host}:{port}{self._escape(r)}">{self._escape(r.lstrip("/"))}</option>'
             for r in video_streams
         )
         audio_options = "\n".join(
-            f'<option value="http://{host}:{port}{r}">{r.lstrip("/")}</option>'
+            f'<option value="http://{host}:{port}{self._escape(r)}">{self._escape(r.lstrip("/"))}</option>'
             for r in audio_streams
         )
 
@@ -142,4 +148,14 @@ class PlayerHandler:
 </script>
 </body>
 </html>"""
-        return web.Response(text=html, content_type="text/html")
+        response = web.Response(text=html, content_type="text/html")
+        if hasattr(request.app, "_server_instance") and request.app._server_instance._enable_security_headers:
+            server = request.app._server_instance
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["X-XSS-Protection"] = "1; mode=block"
+            response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+            response.headers["Content-Security-Policy"] = server._csp_policy
+            if request.url.scheme == "https":
+                response.headers["Strict-Transport-Security"] = f"max-age={server._hsts_max_age}; includeSubDomains"
+        return response
